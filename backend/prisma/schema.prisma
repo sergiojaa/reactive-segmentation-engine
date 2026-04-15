@@ -64,6 +64,12 @@ enum OutboxStatus {
   FAILED
 }
 
+enum DataChangeEventStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
 model Customer {
   id              String                      @id @default(uuid()) @db.Uuid
   externalId      String?                     @unique
@@ -84,6 +90,7 @@ model Customer {
   segmentMemberships      SegmentMembership[]
   segmentMembershipDeltas SegmentMembershipDelta[]
   triggeredRuns           SegmentEvaluationRun[]      @relation("RunTriggeredByCustomer")
+  dataChangeEvents        DataChangeEvent[]
 
   @@index([status])
   @@index([country])
@@ -119,6 +126,7 @@ model Transaction {
   createdAt   DateTime  @default(now())
 
   customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  dataChangeEvents DataChangeEvent[]
 
   @@index([customerId, occurredAt])
   @@index([type, occurredAt])
@@ -191,6 +199,7 @@ model SegmentEvaluationRun {
 
   membershipChanges SegmentMembershipDelta[]
   memberships       SegmentMembership[]
+  dataChangeEvents  DataChangeEvent[]
 
   @@index([segmentId, createdAt(sort: Desc)])
   @@index([status, createdAt])
@@ -263,4 +272,47 @@ model OutboxEvent {
   @@index([aggregateType, aggregateId])
   @@index([eventType, createdAt])
   @@map("outbox_events")
+}
+
+model DataChangeEvent {
+  id            String                @id @default(uuid()) @db.Uuid
+  entityType    String
+  entityId      String                @db.Uuid
+  changeType    String
+  status        DataChangeEventStatus @default(PENDING)
+  source        String?
+  customerId    String?               @db.Uuid
+  transactionId String?               @db.Uuid
+  triggeredRunId String?              @db.Uuid
+  payloadJson   Json?
+  occurredAt    DateTime
+  processedAt   DateTime?
+  retryCount    Int                   @default(0)
+  errorMessage  String?
+  createdAt     DateTime              @default(now())
+
+  customer    Customer?             @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  transaction Transaction?          @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  triggeredRun SegmentEvaluationRun? @relation(fields: [triggeredRunId], references: [id], onDelete: SetNull)
+
+  @@index([status, occurredAt])
+  @@index([entityType, entityId])
+  @@index([customerId])
+  @@index([transactionId])
+  @@index([triggeredRunId])
+  @@map("data_change_events")
+}
+
+model SimulationClock {
+  id             String   @id @default(uuid()) @db.Uuid
+  key            String   @unique @default("global")
+  currentTime    DateTime
+  isFrozen       Boolean  @default(false)
+  tickSeconds    Int      @default(60)
+  lastAdvancedAt DateTime?
+  metadataJson   Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("simulation_clocks")
 }
