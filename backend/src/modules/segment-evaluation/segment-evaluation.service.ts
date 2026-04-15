@@ -3,7 +3,15 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, SegmentType } from '@prisma/client';
+import {
+  DeltaChangeType,
+  EvaluationRunStatus,
+  EvaluationScopeType,
+  EvaluationTriggerType,
+  MembershipStatus,
+  Prisma,
+  SegmentType,
+} from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SimulationsService } from '../simulations/simulations.service';
 import { SegmentEvaluationResultDto } from './dto/segment-evaluation-result.dto';
@@ -54,8 +62,164 @@ export class SegmentEvaluationService {
 
     const rule = this.parseDirectRule(segment.definitionJson);
     const effectiveNow = await this.simulationsService.getEffectiveNow();
+    const evaluatedCustomerIds = await this.evaluateDirectRule(
+      rule,
+      effectiveNow,
+    );
+    const customerIds = this.toSortedUniqueIds(evaluatedCustomerIds);
+    const startedAt = new Date();
 
-    const customerIds = await this.evaluateDirectRule(rule, effectiveNow);
+    const {
+      runId,
+      triggerType,
+      scopeType,
+      status,
+      finishedAt,
+      addedCustomerIds,
+      removedCustomerIds,
+    } = await this.prisma.$transaction(async (tx) => {
+      const previousActiveMemberships = await tx.segmentMembership.findMany({
+        where: {
+          segmentId: segment.id,
+          status: MembershipStatus.ACTIVE,
+        },
+        select: {
+          customerId: true,
+        },
+      });
+
+      const previousCustomerIds = previousActiveMemberships.map(
+        (membership) => membership.customerId,
+      );
+
+      const addedCustomerIds = this.calculateAddedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+      const removedCustomerIds = this.calculateRemovedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+      const retainedCustomerIds = this.calculateRetainedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+
+      const finishedAt = new Date();
+      const run = await tx.segmentEvaluationRun.create({
+        data: {
+          segmentId: segment.id,
+          triggerType: EvaluationTriggerType.MANUAL,
+          scopeType: EvaluationScopeType.FULL,
+          status: EvaluationRunStatus.COMPLETED,
+          startedAt,
+          finishedAt,
+          inputSnapshotJson: {
+            ruleType: rule.ruleType,
+            effectiveNow: effectiveNow.toISOString(),
+          },
+          statisticsJson: {
+            previousCount: previousCustomerIds.length,
+            currentCount: customerIds.length,
+            addedCount: addedCustomerIds.length,
+            removedCount: removedCustomerIds.length,
+          },
+        },
+      });
+
+      if (addedCustomerIds.length > 0) {
+        await tx.segmentMembership.createMany({
+          data: addedCustomerIds.map((customerId) => ({
+            segmentId: segment.id,
+            customerId,
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            isManual: false,
+            addedAt: effectiveNow,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          })),
+          skipDuplicates: true,
+        });
+
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: addedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            addedAt: effectiveNow,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      if (retainedCustomerIds.length > 0) {
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: retainedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      if (removedCustomerIds.length > 0) {
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: removedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.REMOVED,
+            sourceRunId: run.id,
+            removedAt: effectiveNow,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      const membershipDeltaRows = [
+        ...addedCustomerIds.map((customerId) => ({
+          segmentId: segment.id,
+          customerId,
+          runId: run.id,
+          changeType: DeltaChangeType.ADDED,
+          effectiveAt: effectiveNow,
+        })),
+        ...removedCustomerIds.map((customerId) => ({
+          segmentId: segment.id,
+          customerId,
+          runId: run.id,
+          changeType: DeltaChangeType.REMOVED,
+          effectiveAt: effectiveNow,
+        })),
+      ];
+
+      if (membershipDeltaRows.length > 0) {
+        await tx.segmentMembershipDelta.createMany({
+          data: membershipDeltaRows,
+        });
+      }
+
+      return {
+        runId: run.id,
+        triggerType: run.triggerType,
+        scopeType: run.scopeType,
+        status: run.status,
+        finishedAt,
+        addedCustomerIds,
+        removedCustomerIds,
+      };
+    });
 
     return {
       segmentId: segment.id,
@@ -63,7 +227,51 @@ export class SegmentEvaluationService {
       effectiveNow,
       evaluatedAt: effectiveNow,
       customerIds,
+      addedCustomerIds,
+      removedCustomerIds,
+      metadata: {
+        runId,
+        triggerType,
+        scopeType,
+        status,
+        startedAt,
+        finishedAt,
+      },
     };
+  }
+
+  private toSortedUniqueIds(customerIds: string[]): string[] {
+    return [...new Set(customerIds)].sort((a, b) => a.localeCompare(b));
+  }
+
+  private calculateAddedCustomerIds(
+    previousCustomerIds: string[],
+    currentCustomerIds: string[],
+  ): string[] {
+    const previousSet = new Set(previousCustomerIds);
+    return currentCustomerIds.filter(
+      (customerId) => !previousSet.has(customerId),
+    );
+  }
+
+  private calculateRemovedCustomerIds(
+    previousCustomerIds: string[],
+    currentCustomerIds: string[],
+  ): string[] {
+    const currentSet = new Set(currentCustomerIds);
+    return previousCustomerIds.filter(
+      (customerId) => !currentSet.has(customerId),
+    );
+  }
+
+  private calculateRetainedCustomerIds(
+    previousCustomerIds: string[],
+    currentCustomerIds: string[],
+  ): string[] {
+    const previousSet = new Set(previousCustomerIds);
+    return currentCustomerIds.filter((customerId) =>
+      previousSet.has(customerId),
+    );
   }
 
   private parseDirectRule(
