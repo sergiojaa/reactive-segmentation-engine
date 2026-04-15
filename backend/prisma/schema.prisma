@@ -6,3 +6,261 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED
+}
+
+enum SegmentType {
+  DYNAMIC
+  STATIC
+}
+
+enum SegmentStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
+enum DeltaChangeType {
+  ADDED
+  REMOVED
+}
+
+enum EvaluationRunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum EvaluationTriggerType {
+  MANUAL
+  SCHEDULED
+  CUSTOMER_CHANGE
+  TRANSACTION_CHANGE
+  DEPENDENCY_CHANGE
+  SIMULATION
+}
+
+enum EvaluationScopeType {
+  FULL
+  CUSTOMER_SET
+  SIMULATION
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model Customer {
+  id              String                      @id @default(uuid()) @db.Uuid
+  externalId      String?                     @unique
+  email           String?                     @unique
+  firstName       String?
+  lastName        String?
+  status          CustomerStatus              @default(ACTIVE)
+  country         String?
+  city            String?
+  dateOfBirth     DateTime?                   @db.Date
+  attributesJson  Json?
+  createdAt       DateTime                    @default(now())
+  updatedAt       DateTime                    @updatedAt
+  deletedAt       DateTime?
+
+  transactions            Transaction[]
+  attributeSnapshots      CustomerAttributeSnapshot[]
+  segmentMemberships      SegmentMembership[]
+  segmentMembershipDeltas SegmentMembershipDelta[]
+  triggeredRuns           SegmentEvaluationRun[]      @relation("RunTriggeredByCustomer")
+
+  @@index([status])
+  @@index([country])
+  @@index([city])
+  @@index([createdAt])
+  @@map("customers")
+}
+
+model CustomerAttributeSnapshot {
+  id             String    @id @default(uuid()) @db.Uuid
+  customerId     String    @db.Uuid
+  version        Int
+  source         String?
+  attributesJson Json
+  createdAt      DateTime  @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, version])
+  @@index([customerId, createdAt])
+  @@map("customer_attribute_snapshots")
+}
+
+model Transaction {
+  id          String    @id @default(uuid()) @db.Uuid
+  customerId  String    @db.Uuid
+  externalId  String?   @unique
+  type        String
+  amount      Decimal   @db.Decimal(18, 2)
+  currency    String    @db.VarChar(3)
+  occurredAt  DateTime
+  payloadJson Json?
+  createdAt   DateTime  @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, occurredAt])
+  @@index([type, occurredAt])
+  @@index([occurredAt])
+  @@map("transactions")
+}
+
+model Segment {
+  id             String        @id @default(uuid()) @db.Uuid
+  key            String        @unique
+  name           String
+  description    String?
+  type           SegmentType
+  status         SegmentStatus @default(DRAFT)
+  version        Int           @default(1)
+  definitionJson Json?
+  frozenAt       DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  deletedAt      DateTime?
+
+  dependencies       SegmentDependency[]    @relation("SegmentDependsOn")
+  dependents         SegmentDependency[]    @relation("SegmentDependent")
+  memberships        SegmentMembership[]
+  membershipDeltas   SegmentMembershipDelta[]
+  evaluationRuns     SegmentEvaluationRun[] @relation("RunSegment")
+  triggeredRuns      SegmentEvaluationRun[] @relation("RunTriggeredBySegment")
+
+  @@index([type, status])
+  @@index([updatedAt])
+  @@map("segments")
+}
+
+model SegmentDependency {
+  id                 String   @id @default(uuid()) @db.Uuid
+  segmentId          String   @db.Uuid
+  dependsOnSegmentId String   @db.Uuid
+  createdAt          DateTime @default(now())
+
+  segment          Segment @relation("SegmentDependent", fields: [segmentId], references: [id], onDelete: Cascade)
+  dependsOnSegment Segment @relation("SegmentDependsOn", fields: [dependsOnSegmentId], references: [id], onDelete: Cascade)
+
+  @@unique([segmentId, dependsOnSegmentId])
+  @@index([segmentId])
+  @@index([dependsOnSegmentId])
+  @@map("segment_dependencies")
+}
+
+model SegmentEvaluationRun {
+  id                    String               @id @default(uuid()) @db.Uuid
+  segmentId             String               @db.Uuid
+  parentRunId           String?              @db.Uuid
+  triggerType           EvaluationTriggerType
+  scopeType             EvaluationScopeType
+  status                EvaluationRunStatus  @default(PENDING)
+  triggeredByCustomerId String?              @db.Uuid
+  triggeredBySegmentId  String?              @db.Uuid
+  inputSnapshotJson     Json?
+  statisticsJson        Json?
+  errorMessage          String?
+  startedAt             DateTime?
+  finishedAt            DateTime?
+  createdAt             DateTime             @default(now())
+
+  segment             Segment               @relation("RunSegment", fields: [segmentId], references: [id], onDelete: Cascade)
+  parentRun           SegmentEvaluationRun? @relation("RunParentChild", fields: [parentRunId], references: [id], onDelete: SetNull)
+  childRuns           SegmentEvaluationRun[] @relation("RunParentChild")
+  triggeredByCustomer Customer?             @relation("RunTriggeredByCustomer", fields: [triggeredByCustomerId], references: [id], onDelete: SetNull)
+  triggeredBySegment  Segment?              @relation("RunTriggeredBySegment", fields: [triggeredBySegmentId], references: [id], onDelete: SetNull)
+
+  membershipChanges SegmentMembershipDelta[]
+  memberships       SegmentMembership[]
+
+  @@index([segmentId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@index([triggerType, createdAt])
+  @@index([parentRunId])
+  @@map("segment_evaluation_runs")
+}
+
+model SegmentMembership {
+  id              String           @id @default(uuid()) @db.Uuid
+  segmentId       String           @db.Uuid
+  customerId      String           @db.Uuid
+  status          MembershipStatus @default(ACTIVE)
+  isManual        Boolean          @default(false)
+  sourceRunId     String?          @db.Uuid
+  addedAt         DateTime?
+  removedAt       DateTime?
+  lastEvaluatedAt DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  segment   Segment               @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  customer  Customer              @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sourceRun SegmentEvaluationRun? @relation(fields: [sourceRunId], references: [id], onDelete: SetNull)
+
+  @@unique([segmentId, customerId])
+  @@index([segmentId, status, customerId])
+  @@index([customerId, status])
+  @@index([sourceRunId])
+  @@map("segment_memberships")
+}
+
+model SegmentMembershipDelta {
+  id           String          @id @default(uuid()) @db.Uuid
+  segmentId    String          @db.Uuid
+  customerId   String          @db.Uuid
+  runId        String          @db.Uuid
+  changeType   DeltaChangeType
+  effectiveAt  DateTime        @default(now())
+  reason       String?
+  metadataJson Json?
+  createdAt    DateTime        @default(now())
+
+  segment   Segment              @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  customer  Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  run       SegmentEvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([segmentId, effectiveAt])
+  @@index([customerId, effectiveAt])
+  @@index([runId])
+  @@index([changeType, effectiveAt])
+  @@map("segment_membership_deltas")
+}
+
+model OutboxEvent {
+  id           String       @id @default(uuid()) @db.Uuid
+  aggregateType String
+  aggregateId   String      @db.Uuid
+  eventType     String
+  payloadJson   Json
+  dedupeKey     String?     @unique
+  status        OutboxStatus @default(PENDING)
+  availableAt   DateTime     @default(now())
+  publishedAt   DateTime?
+  retryCount    Int          @default(0)
+  errorMessage  String?
+  createdAt     DateTime     @default(now())
+
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId])
+  @@index([eventType, createdAt])
+  @@map("outbox_events")
+}
