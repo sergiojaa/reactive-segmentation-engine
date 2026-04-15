@@ -26,6 +26,17 @@ type DirectDynamicRuleDefinition = {
   inactivityDays?: number;
 };
 
+type EvaluationContext = {
+  triggerType: EvaluationTriggerType;
+  parentRunId: string | null;
+  triggeredBySegmentId: string | null;
+};
+
+type EvaluationExecutionResult = SegmentEvaluationResultDto & {
+  runId: string;
+  hasMembershipChanges: boolean;
+};
+
 @Injectable()
 export class SegmentEvaluationService {
   constructor(
@@ -36,6 +47,28 @@ export class SegmentEvaluationService {
   async evaluateSegment(
     segmentId: string,
   ): Promise<SegmentEvaluationResultDto> {
+    const visitedSegmentIds = new Set<string>([segmentId]);
+    const evaluation = await this.evaluateSegmentOnce(segmentId, {
+      triggerType: EvaluationTriggerType.MANUAL,
+      parentRunId: null,
+      triggeredBySegmentId: null,
+    });
+
+    if (evaluation.hasMembershipChanges) {
+      await this.cascadeDependentDynamicSegments(
+        segmentId,
+        evaluation.runId,
+        visitedSegmentIds,
+      );
+    }
+
+    return evaluation;
+  }
+
+  private async evaluateSegmentOnce(
+    segmentId: string,
+    context: EvaluationContext,
+  ): Promise<EvaluationExecutionResult> {
     const segment = await this.prisma.segment.findFirst({
       where: {
         id: segmentId,
@@ -71,7 +104,7 @@ export class SegmentEvaluationService {
 
     const {
       runId,
-      triggerType,
+      triggerType: runTriggerType,
       scopeType,
       status,
       finishedAt,
@@ -109,14 +142,17 @@ export class SegmentEvaluationService {
       const run = await tx.segmentEvaluationRun.create({
         data: {
           segmentId: segment.id,
-          triggerType: EvaluationTriggerType.MANUAL,
+          parentRunId: context.parentRunId,
+          triggerType: context.triggerType,
           scopeType: EvaluationScopeType.FULL,
           status: EvaluationRunStatus.COMPLETED,
+          triggeredBySegmentId: context.triggeredBySegmentId,
           startedAt,
           finishedAt,
           inputSnapshotJson: {
             ruleType: rule.ruleType,
             effectiveNow: effectiveNow.toISOString(),
+            triggerType: context.triggerType,
           },
           statisticsJson: {
             previousCount: previousCustomerIds.length,
@@ -231,13 +267,57 @@ export class SegmentEvaluationService {
       removedCustomerIds,
       metadata: {
         runId,
-        triggerType,
+        triggerType: runTriggerType,
         scopeType,
         status,
         startedAt,
         finishedAt,
       },
+      runId,
+      hasMembershipChanges:
+        addedCustomerIds.length > 0 || removedCustomerIds.length > 0,
     };
+  }
+
+  private async cascadeDependentDynamicSegments(
+    changedSegmentId: string,
+    parentRunId: string,
+    visitedSegmentIds: Set<string>,
+  ): Promise<void> {
+    const dependentSegments = await this.prisma.segmentDependency.findMany({
+      where: {
+        dependsOnSegmentId: changedSegmentId,
+        segment: {
+          deletedAt: null,
+          type: SegmentType.DYNAMIC,
+        },
+      },
+      select: {
+        segmentId: true,
+      },
+    });
+
+    for (const dependent of dependentSegments) {
+      if (visitedSegmentIds.has(dependent.segmentId)) {
+        continue;
+      }
+
+      visitedSegmentIds.add(dependent.segmentId);
+
+      const evaluation = await this.evaluateSegmentOnce(dependent.segmentId, {
+        triggerType: EvaluationTriggerType.DEPENDENCY_CHANGE,
+        parentRunId,
+        triggeredBySegmentId: changedSegmentId,
+      });
+
+      if (evaluation.hasMembershipChanges) {
+        await this.cascadeDependentDynamicSegments(
+          dependent.segmentId,
+          evaluation.runId,
+          visitedSegmentIds,
+        );
+      }
+    }
   }
 
   private toSortedUniqueIds(customerIds: string[]): string[] {
