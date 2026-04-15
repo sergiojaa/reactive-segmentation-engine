@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Prisma, PrismaClient } from '@prisma/client';
+import { SegmentRecalculationProcessorService } from '../segment-evaluation/segment-recalculation-processor.service';
 
 type PrismaTx = Prisma.TransactionClient | PrismaClient;
 
@@ -25,6 +26,10 @@ type TransactionCreatedPayload = {
 
 @Injectable()
 export class EventsService {
+  constructor(
+    private readonly segmentRecalculationProcessorService: SegmentRecalculationProcessorService,
+  ) {}
+
   async recordCustomerCreated(
     tx: PrismaTx,
     payload: CustomerCreatedPayload,
@@ -43,6 +48,8 @@ export class EventsService {
         }),
       },
     });
+
+    await this.segmentRecalculationProcessorService.notifyDataChangeRecorded();
   }
 
   async recordCustomerUpdated(
@@ -63,6 +70,8 @@ export class EventsService {
         }),
       },
     });
+
+    await this.segmentRecalculationProcessorService.notifyDataChangeRecorded();
   }
 
   async recordTransactionCreated(
@@ -84,6 +93,8 @@ export class EventsService {
         }),
       },
     });
+
+    await this.segmentRecalculationProcessorService.notifyDataChangeRecorded();
   }
 
   private toJsonInputValue(value: unknown): Prisma.InputJsonValue {
