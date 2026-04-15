@@ -16,10 +16,10 @@ describe('AppController (e2e)', () => {
     await app.init();
   });
 
-  it('/ (GET)', () => {
+  it('/api/health/live (GET)', () => {
     return request(app.getHttpServer())
-      .get('/')
+      .get('/api/health/live')
       .expect(200)
-      .expect('Hello World!');
+      .expect({ status: 'ok' });
   });
 });

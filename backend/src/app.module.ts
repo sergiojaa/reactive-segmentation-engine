@@ -1,6 +1,8 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { validationSchema } from './common/config/env.validation';
+import { HealthModule } from './common/health/health.module';
+import { HttpLoggingMiddleware } from './common/logging/http-logging.middleware';
 import { RabbitMqModule } from './common/rabbitmq/rabbitmq.module';
 import { RedisModule } from './common/redis/redis.module';
 import { CustomersModule } from './modules/customers/customers.module';
@@ -26,6 +28,7 @@ import { PrismaModule } from './prisma/prisma.module';
     PrismaModule,
     RedisModule,
     RabbitMqModule,
+    HealthModule,
     CustomersModule,
     TransactionsModule,
     SegmentsModule,
@@ -34,4 +37,8 @@ import { PrismaModule } from './prisma/prisma.module';
     SimulationsModule,
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(HttpLoggingMiddleware).forRoutes('*');
+  }
+}
