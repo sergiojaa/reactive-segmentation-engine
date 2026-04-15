@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { validationSchema } from './common/config/env.validation';
+import { RabbitMqModule } from './common/rabbitmq/rabbitmq.module';
+import { RedisModule } from './common/redis/redis.module';
 import { CustomersModule } from './modules/customers/customers.module';
 import { EventsModule } from './modules/events/events.module';
 import { SegmentEvaluationModule } from './modules/segment-evaluation/segment-evaluation.module';
@@ -22,6 +24,8 @@ import { PrismaModule } from './prisma/prisma.module';
       },
     }),
     PrismaModule,
+    RedisModule,
+    RabbitMqModule,
     CustomersModule,
     TransactionsModule,
     SegmentsModule,
