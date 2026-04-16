@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { SegmentDeltaSignalsModule } from '../segment-delta-signals/segment-delta-signals.module';
 import { SimulationsModule } from '../simulations/simulations.module';
 import { SegmentEvaluationController } from './segment-evaluation.controller';
@@ -6,7 +6,7 @@ import { SegmentRecalculationProcessorService } from './segment-recalculation-pr
 import { SegmentEvaluationService } from './segment-evaluation.service';
 
 @Module({
-  imports: [SimulationsModule, SegmentDeltaSignalsModule],
+  imports: [forwardRef(() => SimulationsModule), SegmentDeltaSignalsModule],
   controllers: [SegmentEvaluationController],
   providers: [SegmentEvaluationService, SegmentRecalculationProcessorService],
   exports: [SegmentEvaluationService, SegmentRecalculationProcessorService],

@@ -24,6 +24,14 @@ type TransactionCreatedPayload = {
   occurredAt: string;
 };
 
+type SimulationClockAdvancedPayload = {
+  clockId: string;
+  previousTime: Date;
+  currentTime: Date;
+  advancedBySeconds: number;
+  reason?: string;
+};
+
 @Injectable()
 export class EventsService {
   constructor(
@@ -90,6 +98,30 @@ export class EventsService {
         payloadJson: this.toJsonInputValue({
           ...payload,
           triggerHint: 'TRANSACTION_REEVALUATION',
+        }),
+      },
+    });
+
+    await this.segmentRecalculationProcessorService.notifyDataChangeRecorded();
+  }
+
+  async recordSimulationClockAdvanced(
+    tx: PrismaTx,
+    payload: SimulationClockAdvancedPayload,
+  ): Promise<void> {
+    await tx.dataChangeEvent.create({
+      data: {
+        entityType: 'SIMULATION_CLOCK',
+        entityId: payload.clockId,
+        changeType: 'ADVANCED',
+        source: 'simulation.clock.advance',
+        occurredAt: payload.currentTime,
+        payloadJson: this.toJsonInputValue({
+          previousTime: payload.previousTime.toISOString(),
+          currentTime: payload.currentTime.toISOString(),
+          advancedBySeconds: payload.advancedBySeconds,
+          reason: payload.reason ?? null,
+          triggerHint: 'TIME_ADVANCE_REEVALUATION',
         }),
       },
     });
