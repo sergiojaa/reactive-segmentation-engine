@@ -15,7 +15,10 @@ import {
 import { PrismaService } from '../../prisma/prisma.service';
 import { SegmentDeltaSignalBridgeService } from '../segment-delta-signals/segment-delta-signal-bridge.service';
 import { SimulationsService } from '../simulations/simulations.service';
+import { SegmentDeltaHistoryDto } from './dto/segment-delta-history.dto';
 import { SegmentEvaluationResultDto } from './dto/segment-evaluation-result.dto';
+import { SegmentEvaluationRunHistoryDto } from './dto/segment-evaluation-run-history.dto';
+import { SegmentMembershipSnapshotDto } from './dto/segment-membership-snapshot.dto';
 
 type DirectDynamicRuleType = 'ACTIVE_BUYERS' | 'VIP_CUSTOMERS' | 'RISK_GROUP';
 
@@ -65,6 +68,157 @@ export class SegmentEvaluationService {
     }
 
     return evaluation;
+  }
+
+  async refreshStaticSegment(
+    segmentId: string,
+  ): Promise<SegmentEvaluationResultDto> {
+    const visitedSegmentIds = new Set<string>([segmentId]);
+    const evaluation = await this.evaluateStaticSegmentOnce(segmentId, {
+      triggerType: EvaluationTriggerType.MANUAL,
+      parentRunId: null,
+      triggeredBySegmentId: null,
+    });
+
+    if (evaluation.hasMembershipChanges) {
+      await this.cascadeDependentDynamicSegments(
+        segmentId,
+        evaluation.runId,
+        visitedSegmentIds,
+      );
+    }
+
+    return evaluation;
+  }
+
+  async getCurrentMembership(
+    segmentId: string,
+  ): Promise<SegmentMembershipSnapshotDto> {
+    const segment = await this.prisma.segment.findFirst({
+      where: { id: segmentId, deletedAt: null },
+      select: { id: true, type: true },
+    });
+
+    if (!segment) {
+      throw new NotFoundException(
+        `Segment with id "${segmentId}" was not found`,
+      );
+    }
+
+    const rows = await this.prisma.segmentMembership.findMany({
+      where: {
+        segmentId: segment.id,
+        status: MembershipStatus.ACTIVE,
+      },
+      orderBy: [{ addedAt: 'desc' }, { customerId: 'asc' }],
+      select: {
+        customerId: true,
+        addedAt: true,
+        lastEvaluatedAt: true,
+        isManual: true,
+        customer: {
+          select: {
+            email: true,
+            firstName: true,
+            lastName: true,
+          },
+        },
+      },
+    });
+
+    return {
+      segmentId: segment.id,
+      segmentType: segment.type,
+      activeCount: rows.length,
+      customerIds: rows.map((row) => row.customerId),
+      members: rows.map((row) => ({
+        customerId: row.customerId,
+        email: row.customer.email,
+        firstName: row.customer.firstName,
+        lastName: row.customer.lastName,
+        addedAt: row.addedAt,
+        lastEvaluatedAt: row.lastEvaluatedAt,
+        isManual: row.isManual,
+      })),
+    };
+  }
+
+  async getSegmentDeltaHistory(
+    segmentId: string,
+    limit: number,
+  ): Promise<SegmentDeltaHistoryDto> {
+    await this.ensureSegmentExists(segmentId);
+
+    const [total, rows] = await Promise.all([
+      this.prisma.segmentMembershipDelta.count({
+        where: { segmentId },
+      }),
+      this.prisma.segmentMembershipDelta.findMany({
+        where: { segmentId },
+        take: limit,
+        orderBy: [{ effectiveAt: 'desc' }, { id: 'desc' }],
+        select: {
+          id: true,
+          runId: true,
+          customerId: true,
+          changeType: true,
+          effectiveAt: true,
+          createdAt: true,
+          customer: {
+            select: { email: true },
+          },
+        },
+      }),
+    ]);
+
+    return {
+      segmentId,
+      total,
+      items: rows.map((row) => ({
+        id: row.id,
+        runId: row.runId,
+        customerId: row.customerId,
+        customerEmail: row.customer.email,
+        changeType: row.changeType,
+        effectiveAt: row.effectiveAt,
+        createdAt: row.createdAt,
+      })),
+    };
+  }
+
+  async getSegmentEvaluationRuns(
+    segmentId: string,
+    limit: number,
+  ): Promise<SegmentEvaluationRunHistoryDto> {
+    await this.ensureSegmentExists(segmentId);
+
+    const [total, rows] = await Promise.all([
+      this.prisma.segmentEvaluationRun.count({
+        where: { segmentId },
+      }),
+      this.prisma.segmentEvaluationRun.findMany({
+        where: { segmentId },
+        take: limit,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        select: {
+          id: true,
+          parentRunId: true,
+          triggerType: true,
+          scopeType: true,
+          status: true,
+          startedAt: true,
+          finishedAt: true,
+          createdAt: true,
+          statisticsJson: true,
+        },
+      }),
+    ]);
+
+    return {
+      segmentId,
+      total,
+      items: rows,
+    };
   }
 
   private async evaluateSegmentOnce(
@@ -293,6 +447,235 @@ export class SegmentEvaluationService {
     };
   }
 
+  private async evaluateStaticSegmentOnce(
+    segmentId: string,
+    context: EvaluationContext,
+  ): Promise<EvaluationExecutionResult> {
+    const segment = await this.prisma.segment.findFirst({
+      where: {
+        id: segmentId,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        type: true,
+        definitionJson: true,
+      },
+    });
+
+    if (!segment) {
+      throw new NotFoundException(
+        `Segment with id "${segmentId}" was not found`,
+      );
+    }
+
+    if (segment.type !== SegmentType.STATIC) {
+      throw new BadRequestException(
+        'Manual refresh endpoint supports only static segments',
+      );
+    }
+
+    const explicitCustomerIds = this.parseStaticManualCustomerIds(
+      segment.definitionJson,
+    );
+    const effectiveNow = await this.simulationsService.getEffectiveNow();
+    const customerIds = this.toSortedUniqueIds(
+      await this.filterExistingCustomerIds(explicitCustomerIds),
+    );
+    const startedAt = new Date();
+
+    const {
+      runId,
+      triggerType: runTriggerType,
+      scopeType,
+      status,
+      finishedAt,
+      addedCustomerIds,
+      removedCustomerIds,
+    } = await this.prisma.$transaction(async (tx) => {
+      const previousActiveMemberships = await tx.segmentMembership.findMany({
+        where: {
+          segmentId: segment.id,
+          status: MembershipStatus.ACTIVE,
+        },
+        select: {
+          customerId: true,
+        },
+      });
+
+      const previousCustomerIds = previousActiveMemberships.map(
+        (membership) => membership.customerId,
+      );
+      const addedCustomerIds = this.calculateAddedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+      const removedCustomerIds = this.calculateRemovedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+      const retainedCustomerIds = this.calculateRetainedCustomerIds(
+        previousCustomerIds,
+        customerIds,
+      );
+
+      const finishedAt = new Date();
+      const run = await tx.segmentEvaluationRun.create({
+        data: {
+          segmentId: segment.id,
+          parentRunId: context.parentRunId,
+          triggerType: context.triggerType,
+          scopeType: EvaluationScopeType.FULL,
+          status: EvaluationRunStatus.COMPLETED,
+          triggeredBySegmentId: context.triggeredBySegmentId,
+          startedAt,
+          finishedAt,
+          inputSnapshotJson: {
+            ruleType: 'STATIC_MANUAL',
+            effectiveNow: effectiveNow.toISOString(),
+            triggerType: context.triggerType,
+            source: 'definitionJson.customerIds',
+          },
+          statisticsJson: {
+            previousCount: previousCustomerIds.length,
+            currentCount: customerIds.length,
+            addedCount: addedCustomerIds.length,
+            removedCount: removedCustomerIds.length,
+          },
+        },
+      });
+
+      if (addedCustomerIds.length > 0) {
+        await tx.segmentMembership.createMany({
+          data: addedCustomerIds.map((customerId) => ({
+            segmentId: segment.id,
+            customerId,
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            isManual: true,
+            addedAt: effectiveNow,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          })),
+          skipDuplicates: true,
+        });
+
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: addedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            isManual: true,
+            addedAt: effectiveNow,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      if (retainedCustomerIds.length > 0) {
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: retainedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.ACTIVE,
+            sourceRunId: run.id,
+            isManual: true,
+            removedAt: null,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      if (removedCustomerIds.length > 0) {
+        await tx.segmentMembership.updateMany({
+          where: {
+            segmentId: segment.id,
+            customerId: { in: removedCustomerIds },
+          },
+          data: {
+            status: MembershipStatus.REMOVED,
+            sourceRunId: run.id,
+            isManual: true,
+            removedAt: effectiveNow,
+            lastEvaluatedAt: effectiveNow,
+          },
+        });
+      }
+
+      const membershipDeltaRows = [
+        ...addedCustomerIds.map((customerId) => ({
+          segmentId: segment.id,
+          customerId,
+          runId: run.id,
+          changeType: DeltaChangeType.ADDED,
+          effectiveAt: effectiveNow,
+        })),
+        ...removedCustomerIds.map((customerId) => ({
+          segmentId: segment.id,
+          customerId,
+          runId: run.id,
+          changeType: DeltaChangeType.REMOVED,
+          effectiveAt: effectiveNow,
+        })),
+      ];
+
+      if (membershipDeltaRows.length > 0) {
+        await tx.segmentMembershipDelta.createMany({
+          data: membershipDeltaRows,
+        });
+      }
+
+      return {
+        runId: run.id,
+        triggerType: run.triggerType,
+        scopeType: run.scopeType,
+        status: run.status,
+        finishedAt,
+        addedCustomerIds,
+        removedCustomerIds,
+      };
+    });
+
+    if (addedCustomerIds.length > 0 || removedCustomerIds.length > 0) {
+      this.segmentDeltaSignalBridge.publish({
+        segmentId: segment.id,
+        evaluationRunId: runId,
+        addedCustomerIds,
+        removedCustomerIds,
+        addedCount: addedCustomerIds.length,
+        removedCount: removedCustomerIds.length,
+        timestamp: finishedAt.toISOString(),
+      });
+    }
+
+    return {
+      segmentId: segment.id,
+      ruleType: 'STATIC_MANUAL',
+      effectiveNow,
+      evaluatedAt: effectiveNow,
+      customerIds,
+      addedCustomerIds,
+      removedCustomerIds,
+      metadata: {
+        runId,
+        triggerType: runTriggerType,
+        scopeType,
+        status,
+        startedAt,
+        finishedAt,
+      },
+      runId,
+      hasMembershipChanges:
+        addedCustomerIds.length > 0 || removedCustomerIds.length > 0,
+    };
+  }
+
   private async cascadeDependentDynamicSegments(
     changedSegmentId: string,
     parentRunId: string,
@@ -401,6 +784,36 @@ export class SegmentEvaluationService {
       minTotalAmount: this.toOptionalPositiveNumber(candidate.minTotalAmount),
       inactivityDays: this.toOptionalPositiveInt(candidate.inactivityDays),
     };
+  }
+
+  private parseStaticManualCustomerIds(
+    definitionJson: Prisma.JsonValue | null,
+  ): string[] {
+    if (
+      !definitionJson ||
+      typeof definitionJson !== 'object' ||
+      Array.isArray(definitionJson)
+    ) {
+      throw new BadRequestException(
+        'Static segment definitionJson must be an object with customerIds',
+      );
+    }
+
+    const candidate = definitionJson as Record<string, unknown>;
+    const customerIds = candidate.customerIds;
+    if (!Array.isArray(customerIds)) {
+      throw new BadRequestException(
+        'Static segment manual refresh requires definitionJson.customerIds as string[]',
+      );
+    }
+
+    if (!customerIds.every((entry) => typeof entry === 'string')) {
+      throw new BadRequestException(
+        'Static segment definitionJson.customerIds must contain only strings',
+      );
+    }
+
+    return customerIds as string[];
   }
 
   private async evaluateDirectRule(
@@ -529,6 +942,18 @@ export class SegmentEvaluationService {
     });
 
     return rows.map((row) => row.id);
+  }
+
+  private async ensureSegmentExists(segmentId: string): Promise<void> {
+    const segment = await this.prisma.segment.findFirst({
+      where: { id: segmentId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!segment) {
+      throw new NotFoundException(
+        `Segment with id "${segmentId}" was not found`,
+      );
+    }
   }
 
   private subtractDays(base: Date, days: number): Date {
