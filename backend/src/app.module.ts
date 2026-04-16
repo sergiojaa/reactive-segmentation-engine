@@ -7,6 +7,7 @@ import { RabbitMqModule } from './common/rabbitmq/rabbitmq.module';
 import { RedisModule } from './common/redis/redis.module';
 import { CustomersModule } from './modules/customers/customers.module';
 import { EventsModule } from './modules/events/events.module';
+import { SegmentDeltaSignalsModule } from './modules/segment-delta-signals/segment-delta-signals.module';
 import { SegmentEvaluationModule } from './modules/segment-evaluation/segment-evaluation.module';
 import { SegmentsModule } from './modules/segments/segments.module';
 import { SimulationsModule } from './modules/simulations/simulations.module';
@@ -33,6 +34,7 @@ import { PrismaModule } from './prisma/prisma.module';
     TransactionsModule,
     SegmentsModule,
     SegmentEvaluationModule,
+    SegmentDeltaSignalsModule,
     EventsModule,
     SimulationsModule,
   ],

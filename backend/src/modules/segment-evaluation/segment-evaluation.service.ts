@@ -13,6 +13,7 @@ import {
   SegmentType,
 } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
+import { SegmentDeltaSignalBridgeService } from '../segment-delta-signals/segment-delta-signal-bridge.service';
 import { SimulationsService } from '../simulations/simulations.service';
 import { SegmentEvaluationResultDto } from './dto/segment-evaluation-result.dto';
 
@@ -42,6 +43,7 @@ export class SegmentEvaluationService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly simulationsService: SimulationsService,
+    private readonly segmentDeltaSignalBridge: SegmentDeltaSignalBridgeService,
   ) {}
 
   async evaluateSegment(
@@ -256,6 +258,18 @@ export class SegmentEvaluationService {
         removedCustomerIds,
       };
     });
+
+    if (addedCustomerIds.length > 0 || removedCustomerIds.length > 0) {
+      this.segmentDeltaSignalBridge.publish({
+        segmentId: segment.id,
+        evaluationRunId: runId,
+        addedCustomerIds,
+        removedCustomerIds,
+        addedCount: addedCustomerIds.length,
+        removedCount: removedCustomerIds.length,
+        timestamp: finishedAt.toISOString(),
+      });
+    }
 
     return {
       segmentId: segment.id,
