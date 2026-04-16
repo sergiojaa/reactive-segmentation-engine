@@ -257,76 +257,71 @@ Important demo detail:
 
 ### Components Overview
 
-```mermaid
-flowchart TD
-  subgraph API[HTTP Layer]
-    SegmentsController[Segments CRUD]
-    CustomersController[Customers API]
-    TransactionsController[Transaction API]
-    SimulationsController[Simulations API]
-    SegmentEvaluationController[Segment Evaluation APIs]
-    SegmentDeltaSignalsController[Delta Signals SSE/Recent]
-  end
+At a high level, the system is split into:
 
-  subgraph Core[Core Pipeline]
-    EventsService[EventsService: records DataChangeEvent]
-    SegmentRecalc[SegmentRecalculationProcessorService: batch/debounce worker]
-    SegmentEvaluationService[SegmentEvaluationService: evaluate + persist]
-    Prisma[Prisma/Postgres]
-    Redis[Redis (debounce + lock)]
-  end
+- **HTTP/API layer**
+  - `SegmentsController` for segment CRUD.
+  - `CustomersController` for customer write APIs.
+  - `TransactionsController` for transaction writes.
+  - `SimulationsController` for simulation time and simulated transactions.
+  - `SegmentEvaluationController` for forcing evaluations and inspecting membership/deltas.
+  - `SegmentDeltaSignalsController` for exposing delta signals over SSE and a recent buffer.
+- **Core pipeline**
+  - `EventsService` records `DataChangeEvent` rows in Postgres.
+  - `SegmentRecalculationProcessorService` is the Redis-backed batch/debounce worker.
+  - `SegmentEvaluationService` evaluates segments and persists membership + delta history to Postgres (via Prisma).
+  - Redis is used for debounce scheduling and worker locking.
+- **Demo signal layer**
+  - `SegmentDeltaSignalBridgeService` is an in-process pub/sub bridge that turns evaluation deltas into demo-friendly signals.
+  - `SegmentDeltaBackgroundConsumer` consumes those signals for background/demo logging.
 
-  subgraph DemoSignals[Demo Signals]
-    DeltaBridge[SegmentDeltaSignalBridgeService: in-process pub/sub]
-    DeltaConsumer[SegmentDeltaBackgroundConsumer: demo logs]
-  end
+The main data flow is:
 
-  SegmentsController --> Prisma
-  CustomersController --> EventsService
-  TransactionsController --> EventsService
-  SimulationsController --> EventsService
-
-  EventsService --> Prisma
-  SegmentRecalc --> Redis
-  SegmentRecalc --> SegmentEvaluationService
-  SegmentEvaluationService --> Prisma
-
-  SegmentEvaluationService --> DeltaBridge
-  DeltaBridge --> SegmentDeltaSignalsController
-  DeltaBridge --> DeltaConsumer
-```
+- API controllers receive HTTP requests.
+- Write APIs call `EventsService` or Prisma directly (for pure CRUD).
+- `EventsService` persists `DataChangeEvent` rows to Postgres.
+- The batch worker (`SegmentRecalculationProcessorService`) uses Redis to coordinate when to run and to avoid concurrent workers.
+- When a run executes, `SegmentEvaluationService` reads from Postgres, evaluates segments, writes updated membership/deltas, and then hands off to `SegmentDeltaSignalBridgeService`.
+- The bridge exposes recent deltas via the SSE stream and recent-buffer endpoints and also feeds the background consumer.
 
 ### Signal Flow (Membership Delta Emission)
 
-```mermaid
-flowchart LR
-  W[Write APIs\n(customer/transaction/time)] --> E[EventsService\nDataChangeEvent PENDING + schedule debounce]
-  E --> DB[(Postgres)]
-  DB --> R[SegmentRecalculationProcessor\nor direct evaluation endpoint]
-  R --> Eval[SegmentEvaluationService\nmembership diff + persist deltas]
-  Eval --> DB
-  Eval --> Bridge[SegmentDeltaSignalBridgeService]
-  Bridge --> SSE[GET /api/events/segment-deltas/stream\nSSE]
-  Bridge --> Recent[GET /api/events/segment-deltas/recent]
-```
+The membership delta signal pipeline works as follows:
+
+1. **Write APIs** (customer updates, transactions, simulation time changes) are called.
+2. These APIs record a `DataChangeEvent` with status `PENDING` via `EventsService` and schedule a debounced recalculation.
+3. `DataChangeEvent` rows are stored in **Postgres**.
+4. The recalculation worker (or a direct evaluation endpoint) picks up pending events and invokes `SegmentEvaluationService`.
+5. `SegmentEvaluationService`:
+   - Computes membership diffs for all relevant segments.
+   - Persists updated membership and delta rows back to Postgres.
+6. For each change in membership, `SegmentEvaluationService` notifies `SegmentDeltaSignalBridgeService`.
+7. The bridge:
+   - Pushes events into an in-memory recent buffer exposed at `GET /api/events/segment-deltas/recent`.
+   - Streams live updates over SSE at `GET /api/events/segment-deltas/stream`.
+
+This gives you both a **correctness trail** (via persisted deltas) and a **live signal surface** (via SSE/recent endpoints) for interviews and demos.
 
 ### Batch / Debounce / Recalculation Flow
 
-```mermaid
-flowchart TD
-  A[Write API call] --> B[Create DataChangeEvent row (PENDING)]
-  B --> C[notifyDataChangeRecorded()]
-  C --> D[Redis: set segment-recalc:next-run-at-ms = now + debounceWindow]
-  D --> E[Worker tick loop\npoll interval]
-  E --> F{Due to run?}
-  F -- No --> E
-  F -- Yes --> G[Acquire Redis lock]
-  G --> H[Fetch pending events chunk\n(eventChunkSize)]
-  H --> I[Evaluate dynamic segments\n(segmentChunkSize)]
-  I --> J[Persist membership + deltas]
-  J --> K[Mark events as PROCESSED]
-  K --> E
-```
+The batch/ debounce worker behaves like a simple scheduled job:
+
+1. A **write API call** creates a `DataChangeEvent` row with status `PENDING`.
+2. After inserting the event, the code calls `notifyDataChangeRecorded()`.
+3. `notifyDataChangeRecorded()` sets a Redis key (for example `segment-recalc:next-run-at-ms`) to `now + debounceWindow`.
+4. A background **worker tick loop** runs every `RECALC_POLL_INTERVAL_MS` and:
+   - Reads the `next-run-at` value from Redis.
+   - Checks whether the current time is past that value.
+5. If it is **not yet due**, the worker simply waits for the next tick.
+6. If it **is due**, the worker:
+   - Acquires a Redis lock to ensure only one worker runs at a time.
+   - Fetches a chunk of `PENDING` `DataChangeEvent` rows (up to `eventChunkSize`).
+   - Evaluates all dynamic segments, in chunks of `segmentChunkSize`, using `SegmentEvaluationService`.
+   - Persists updated membership and delta rows.
+   - Marks the processed events as `PROCESSED`.
+7. If the event chunk was full (indicating more work remains), the worker schedules another run immediately; otherwise, it waits for future writes and debounce scheduling.
+
+This keeps the **public write APIs fast**, while giving you a clear, interview-friendly explanation of how debounced, batched recomputation happens in the background.
 
 ## Exact Interview Demo Flow (Step-by-Step)
 
