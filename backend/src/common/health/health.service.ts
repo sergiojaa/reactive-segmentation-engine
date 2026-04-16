@@ -28,9 +28,7 @@ export class HealthService {
       this.redisService.ping(),
     ]);
     const rabbitmq = this.rabbitMqService.isConnected();
-
-    const status = database && redis && rabbitmq ? 'ok' : 'degraded';
-
+    const status = database && redis ? 'ok' : 'degraded';
     return {
       status,
       checks: {
