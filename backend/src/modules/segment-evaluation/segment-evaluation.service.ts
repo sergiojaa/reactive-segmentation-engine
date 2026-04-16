@@ -39,6 +39,7 @@ type EvaluationContext = {
 type EvaluationExecutionResult = SegmentEvaluationResultDto & {
   runId: string;
   hasMembershipChanges: boolean;
+  customerIds: string[];
 };
 
 @Injectable()
@@ -255,7 +256,6 @@ export class SegmentEvaluationService {
       rule,
       effectiveNow,
     );
-    const customerIds = this.toSortedUniqueIds(evaluatedCustomerIds);
     const startedAt = new Date();
 
     const {
@@ -266,7 +266,15 @@ export class SegmentEvaluationService {
       finishedAt,
       addedCustomerIds,
       removedCustomerIds,
+      customerIds,
     } = await this.prisma.$transaction(async (tx) => {
+      const allCustomerIds = this.toSortedUniqueIds(evaluatedCustomerIds);
+      const customerIds = await this.filterByDependencies(
+        tx,
+        segment.id,
+        allCustomerIds,
+      );
+
       const previousActiveMemberships = await tx.segmentMembership.findMany({
         where: {
           segmentId: segment.id,
@@ -410,6 +418,7 @@ export class SegmentEvaluationService {
         finishedAt,
         addedCustomerIds,
         removedCustomerIds,
+        customerIds,
       };
     });
 
@@ -479,7 +488,7 @@ export class SegmentEvaluationService {
       segment.definitionJson,
     );
     const effectiveNow = await this.simulationsService.getEffectiveNow();
-    const customerIds = this.toSortedUniqueIds(
+    const baseCustomerIds = this.toSortedUniqueIds(
       await this.filterExistingCustomerIds(explicitCustomerIds),
     );
     const startedAt = new Date();
@@ -492,7 +501,14 @@ export class SegmentEvaluationService {
       finishedAt,
       addedCustomerIds,
       removedCustomerIds,
+      customerIds,
     } = await this.prisma.$transaction(async (tx) => {
+      const customerIds = await this.filterByDependencies(
+        tx,
+        segment.id,
+        baseCustomerIds,
+      );
+
       const previousActiveMemberships = await tx.segmentMembership.findMany({
         where: {
           segmentId: segment.id,
@@ -639,6 +655,7 @@ export class SegmentEvaluationService {
         finishedAt,
         addedCustomerIds,
         removedCustomerIds,
+        customerIds,
       };
     });
 
@@ -674,6 +691,52 @@ export class SegmentEvaluationService {
       hasMembershipChanges:
         addedCustomerIds.length > 0 || removedCustomerIds.length > 0,
     };
+  }
+  private async filterByDependencies(
+    tx: Prisma.TransactionClient,
+    segmentId: string,
+    customerIds: string[],
+  ): Promise<string[]> {
+    if (customerIds.length === 0) {
+      return [];
+    }
+
+    const dependencies = await tx.segmentDependency.findMany({
+      where: {
+        segmentId,
+      },
+      select: {
+        dependsOnSegmentId: true,
+      },
+    });
+
+    if (dependencies.length === 0) {
+      return customerIds;
+    }
+
+    let filtered = new Set(customerIds);
+
+    for (const dependency of dependencies) {
+      if (filtered.size === 0) {
+        break;
+      }
+
+      const rows = await tx.segmentMembership.findMany({
+        where: {
+          segmentId: dependency.dependsOnSegmentId,
+          status: MembershipStatus.ACTIVE,
+          customerId: { in: Array.from(filtered) },
+        },
+        select: {
+          customerId: true,
+        },
+      });
+
+      const allowed = new Set(rows.map((row) => row.customerId));
+      filtered = new Set(Array.from(filtered).filter((id) => allowed.has(id)));
+    }
+
+    return Array.from(filtered).sort((a, b) => a.localeCompare(b));
   }
 
   private async cascadeDependentDynamicSegments(
@@ -813,7 +876,7 @@ export class SegmentEvaluationService {
       );
     }
 
-    return customerIds as string[];
+    return customerIds;
   }
 
   private async evaluateDirectRule(

@@ -147,8 +147,6 @@ export class SegmentRecalculationProcessorService
         },
       });
 
-      // If the chunk was full, there may be many more events waiting
-      // (e.g. 50K burst). Schedule another run immediately.
       if (pendingEvents.length === this.eventChunkSize) {
         await this.scheduleNextRunAt(Date.now());
       }
@@ -157,6 +155,10 @@ export class SegmentRecalculationProcessorService
         `Processed ${pendingEvents.length} data-change events for ${dynamicSegments.length} dynamic segments (${impactedCustomerCount} distinct customers in batch)`,
       );
     } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Unknown error during data-change processing';
       await this.prisma.dataChangeEvent.updateMany({
         where: {
           id: { in: pendingEvents.map((event) => event.id) },
@@ -165,14 +167,45 @@ export class SegmentRecalculationProcessorService
         data: {
           status: DataChangeEventStatus.FAILED,
           processedAt: new Date(),
-          errorMessage: (error as Error).message,
+          errorMessage: message,
           retryCount: { increment: 1 },
         },
       });
 
       this.logger.error(
-        `Failed processing ${pendingEvents.length} data-change events: ${(error as Error).message}`,
+        `Failed processing ${pendingEvents.length} data-change events: ${message}`,
       );
+
+      await this.prisma.dataChangeEvent.updateMany({
+        where: {
+          id: { in: pendingEvents.map((event) => event.id) },
+          status: DataChangeEventStatus.PENDING,
+          retryCount: { lt: 3 },
+        },
+        data: {
+          status: DataChangeEventStatus.PENDING,
+          processedAt: null,
+          errorMessage: message,
+          retryCount: {
+            increment: 1,
+          },
+        },
+      });
+
+      await this.prisma.dataChangeEvent.updateMany({
+        where: {
+          id: { in: pendingEvents.map((event) => event.id) },
+          status: DataChangeEventStatus.PENDING,
+          retryCount: { gte: 3 },
+        },
+        data: {
+          status: DataChangeEventStatus.FAILED,
+          processedAt: new Date(),
+          errorMessage: message,
+        },
+      });
+
+      await this.scheduleNextRunAt(Date.now() + this.debounceWindowMs);
     }
   }
 

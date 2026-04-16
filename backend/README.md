@@ -80,15 +80,15 @@ And we also emit an in-process delta signal:
 - `GET /api/events/segment-deltas/stream` (SSE)
 - `GET /api/events/segment-deltas/recent` (in-memory buffer for quick demo)
 
-### 3. Dynamic evaluation uses direct rule types (phase simplification)
+### 3. Dynamic evaluation uses direct rule types
 
-For delivery/demo clarity, direct dynamic evaluation supports these rule types only:
+For clarity, dynamic segments use a compact `definitionJson` with a `ruleType` and numeric parameters. Direct dynamic evaluation supports these rule types:
 
 - `ACTIVE_BUYERS`
 - `VIP_CUSTOMERS`
 - `RISK_GROUP`
 
-Dependencies are used for **cascade triggering**, not for "rule evaluation inputs" in this phase.
+If a dynamic segment declares dependencies (via the `segment_dependencies` relation), those dependencies act both as **cascade triggers** and as **filters**: after evaluating the base rule, only customers that are ACTIVE members of all dependent segments are kept.
 
 ## Tradeoffs & Simplifications (Call these out in an interview)
 

@@ -24,9 +24,9 @@ export class RabbitMqService implements OnModuleInit, OnModuleDestroy {
       this.connection = await amqp.connect(rabbitMqUrl);
       this.logger.log('RabbitMQ connection initialized');
     } catch (error) {
-      this.logger.warn(
-        `RabbitMQ is not reachable on startup: ${(error as Error).message}`,
-      );
+      const message =
+        error instanceof Error ? error.message : 'RabbitMQ is not reachable on startup';
+      this.logger.warn(`RabbitMQ is not reachable on startup: ${message}`);
       this.connection = null;
     }
   }

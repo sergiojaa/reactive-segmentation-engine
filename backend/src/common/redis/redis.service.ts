@@ -39,9 +39,9 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
       await this.client.ping();
       this.logger.log('Redis connection initialized');
     } catch (error) {
-      this.logger.warn(
-        `Redis is not reachable on startup: ${(error as Error).message}`,
-      );
+      const message =
+        error instanceof Error ? error.message : 'Redis is not reachable on startup';
+      this.logger.warn(`Redis is not reachable on startup: ${message}`);
     }
   }
 

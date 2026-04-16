@@ -1,4 +1,9 @@
-import { Prisma, PrismaClient, SegmentStatus, SegmentType } from '@prisma/client';
+import {
+  Prisma,
+  PrismaClient,
+  SegmentStatus,
+  SegmentType,
+} from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 
 type CustomerSeed = {
@@ -192,14 +197,9 @@ async function main(): Promise<void> {
         type: SegmentType.DYNAMIC,
         status: SegmentStatus.ACTIVE,
         definitionJson: {
-          kind: 'dynamic',
-          rule: {
-            metric: 'transaction_count',
-            operator: '>=',
-            value: 1,
-            lookbackDays: 30,
-            transactionType: 'purchase',
-          },
+          ruleType: 'ACTIVE_BUYERS',
+          lookbackDays: 30,
+          minTransactions: 1,
         },
       },
       {
@@ -211,21 +211,9 @@ async function main(): Promise<void> {
         type: SegmentType.DYNAMIC,
         status: SegmentStatus.ACTIVE,
         definitionJson: {
-          kind: 'dynamic',
-          dependsOn: [activeSegmentKey],
-          rule: {
-            metric: 'purchase_sum',
-            operator: '>',
-            value: 5000,
-            lookbackDays: 60,
-            transactionType: 'purchase',
-          },
-          filters: [
-            {
-              type: 'segment',
-              segmentKey: activeSegmentKey,
-            },
-          ],
+          ruleType: 'VIP_CUSTOMERS',
+          lookbackDays: 60,
+          minTotalAmount: 5000,
         },
       },
       {
@@ -237,12 +225,8 @@ async function main(): Promise<void> {
         type: SegmentType.DYNAMIC,
         status: SegmentStatus.ACTIVE,
         definitionJson: {
-          kind: 'dynamic',
-          rule: {
-            noPurchasesInLastDays: 90,
-            hadAnyPurchaseBeforeDays: 90,
-            transactionType: 'purchase',
-          },
+          inactivityDays: 90,
+          ruleType: 'RISK_GROUP',
         },
       },
       {
@@ -256,6 +240,16 @@ async function main(): Promise<void> {
           kind: 'static',
           source: 'marketing_csv_import',
           campaign: 'march_2026',
+          customerIds: [
+            'active_01',
+            'active_02',
+            'vip_01',
+            'vip_02',
+            'risk_01',
+            'risk_02',
+            'none_01',
+            'none_02',
+          ].map((customerKey) => customerIdByKey.get(customerKey)!),
         },
       },
     ],
@@ -305,7 +299,6 @@ async function main(): Promise<void> {
     },
   });
 
-  // eslint-disable-next-line no-console
   console.log(
     `Seed completed: ${customers.length} customers, ${transactions.length} transactions, 4 segments.`,
   );
@@ -313,7 +306,6 @@ async function main(): Promise<void> {
 
 void main()
   .catch(async (error) => {
-    // eslint-disable-next-line no-console
     console.error('Seed failed', error);
     process.exitCode = 1;
     await prisma.$disconnect();
